@@ -1,8 +1,0 @@
-{
-  "threshold": 0.35,
-  "model_type": "RandomForestClassifier",
-  "n_features": 41,
-  "target": "no_show",
-  "recall_gelmedi": 0.84,
-  "precision_gelmedi": 0.24
-}
