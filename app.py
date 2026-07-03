@@ -6,9 +6,11 @@ modelin beklediği 26 sütuna çevirir, no-show olasılığı + risk seviyesi d�
 Render start command:  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
 
+import os
 import json
 import joblib
 import pandas as pd
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -26,6 +28,17 @@ with open(SCHEMA_PATH, "r") as f:
 
 FEATURE_NAMES = SCHEMA["feature_names"]      # 26 sütun, DOĞRU sırada
 THRESHOLD = SCHEMA.get("threshold", 0.15)
+
+# ----------------------------------------------------------------------
+# Gemini ayarları — anahtar Render Environment Variable'dan okunur
+# (kodda GÖRÜNMEZ, GitHub'a gitmez)
+# ----------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 # Kabul edilen kategori seçenekleri (frontend'in gönderebileceği değerler)
 CLINIC_OPTIONS = [
@@ -62,6 +75,17 @@ class PredictRequest(BaseModel):
     ethnicity: str = Field("Hispanic", description=f"Seçenekler: {ETHNICITY_OPTIONS}")
     race: str = Field("Other", description=f"Seçenekler: {RACE_OPTIONS}")
     clinic: str = Field("OTHER", description=f"Seçenekler: {CLINIC_OPTIONS}")
+
+
+class MessageRequest(BaseModel):
+    """AI hatırlatma mesajı üretmek için gereken bilgiler."""
+    patient_name: str = Field("Değerli hastamız", description="Hastanın adı (opsiyonel)")
+    risk_band: str = Field(..., description="Düşük / Orta / Yüksek")
+    noshow_percent: float = Field(..., description="No-show yüzdesi (0-100)")
+    clinic: str = Field("kliniğimiz", description="Klinik adı")
+    appt_type: str = Field("Follow-up", description="Randevu tipi")
+    lead_time: int = Field(0, description="Randevuya kaç gün var")
+    tone: str = Field("samimi", description="Mesaj tonu: samimi / resmi / kısa")
 
 
 # ----------------------------------------------------------------------
@@ -180,3 +204,68 @@ def predict(req: PredictRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ----------------------------------------------------------------------
+# 5) AI hatırlatma mesajı — gerçek Gemini çağrısı
+# ----------------------------------------------------------------------
+def build_prompt(r: MessageRequest) -> str:
+    """Gemini'ye gönderilecek Türkçe talimatı hazırlar."""
+    ton_aciklama = {
+        "samimi": "sıcak, samimi ve nazik bir ton",
+        "resmi": "resmi ve profesyonel bir ton",
+        "kısa": "çok kısa ve öz, tek cümlelik bir ton",
+    }.get(r.tone, "sıcak ve nazik bir ton")
+
+    return f"""Sen bir sağlık kliniğinin hasta iletişim asistanısın.
+Aşağıdaki hastaya, yaklaşan randevusu için nazik bir hatırlatma mesajı yaz.
+
+Hasta bilgileri:
+- İsim: {r.patient_name}
+- Randevuya gelmeme (no-show) risk seviyesi: {r.risk_band} (%{r.noshow_percent})
+- Klinik: {r.clinic}
+- Randevu tipi: {r.appt_type}
+- Randevuya kalan gün: {r.lead_time}
+
+Kurallar:
+- Mesaj Türkçe olsun ve {ton_aciklama} kullansın.
+- Risk seviyesi 'Yüksek' ise, gelmenin önemini nazikçe vurgula ve onay/iptal için kolay bir çağrı ekle.
+- Risk 'Orta' ise dostça bir hatırlatma yeterli.
+- Risk 'Düşük' ise kısa ve olumlu bir hatırlatma yaz.
+- Hastayı suçlayan, baskılayan veya kaygı yaratan ifadeler KULLANMA.
+- Risk yüzdesini veya 'no-show' kelimesini mesajın içinde ASLA yazma (bunlar sadece senin bilgin).
+- Sadece mesajın kendisini döndür, başka açıklama ekleme.
+- Mesaj en fazla 4-5 cümle olsun."""
+
+
+@app.post("/generate-message")
+def generate_message(req: MessageRequest):
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY tanımlı değil. Render Environment Variables'a ekleyin.",
+        )
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": build_prompt(req)}]}],
+            "generationConfig": {"temperature": 0.8, "maxOutputTokens": 300},
+        }
+        resp = requests.post(
+            GEMINI_URL,
+            headers={"Content-Type": "application/json"},
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Gemini cevabından metni çıkar
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return {"message": text, "model": GEMINI_MODEL}
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(status_code=502, detail=f"Gemini hatası: {detail}")
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Gemini beklenmeyen bir cevap döndü.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
