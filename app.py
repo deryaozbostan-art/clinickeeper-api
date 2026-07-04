@@ -252,8 +252,10 @@ def generate_message(req: MessageRequest):
         }
         resp = requests.post(
             GEMINI_URL,
-            headers={"Content-Type": "application/json"},
-            params={"key": GEMINI_API_KEY},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
             json=payload,
             timeout=30,
         )
