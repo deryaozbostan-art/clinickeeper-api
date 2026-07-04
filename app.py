@@ -10,11 +10,17 @@ import os
 import json
 import joblib
 import pandas as pd
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
 
 # ----------------------------------------------------------------------
 # 1) Model ve şemayı yükle
@@ -32,13 +38,19 @@ THRESHOLD = SCHEMA.get("threshold", 0.15)
 # ----------------------------------------------------------------------
 # Gemini ayarları — anahtar Render Environment Variable'dan okunur
 # (kodda GÖRÜNMEZ, GitHub'a gitmez)
+# google-genai SDK'sı hem AIza hem AQ. formatındaki anahtarları destekler.
 # ----------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+_gemini_client = None
+def get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        if genai is None:
+            raise RuntimeError("google-genai kütüphanesi yüklü değil.")
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
 
 # Kabul edilen kategori seçenekleri (frontend'in gönderebileceği değerler)
 CLINIC_OPTIONS = [
@@ -246,28 +258,21 @@ def generate_message(req: MessageRequest):
             detail="GEMINI_API_KEY tanımlı değil. Render Environment Variables'a ekleyin.",
         )
     try:
-        payload = {
-            "contents": [{"parts": [{"text": build_prompt(req)}]}],
-            "generationConfig": {"temperature": 0.8, "maxOutputTokens": 300},
-        }
-        resp = requests.post(
-            GEMINI_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
-            },
-            json=payload,
-            timeout=30,
+        client = get_gemini_client()
+        config = genai_types.GenerateContentConfig(
+            temperature=0.8,
+            max_output_tokens=400,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        # Gemini cevabından metni çıkar
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=build_prompt(req),
+            config=config,
+        )
+        text = (resp.text or "").strip()
+        if not text:
+            raise HTTPException(status_code=502, detail="Gemini boş cevap döndü.")
         return {"message": text, "model": GEMINI_MODEL}
-    except requests.HTTPError as e:
-        detail = e.response.text if e.response is not None else str(e)
-        raise HTTPException(status_code=502, detail=f"Gemini hatası: {detail}")
-    except (KeyError, IndexError):
-        raise HTTPException(status_code=502, detail="Gemini beklenmeyen bir cevap döndü.")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=502, detail=f"Gemini hatası: {str(e)}")
