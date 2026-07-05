@@ -15,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 
+import urllib.request
+import urllib.error
+
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -51,6 +54,43 @@ def get_gemini_client():
             raise RuntimeError("google-genai kütüphanesi yüklü değil.")
         _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     return _gemini_client
+
+# ----------------------------------------------------------------------
+# Groq ayarları — Gemini alternatifi (ücretsiz, AQ. sorunu yok)
+# GROQ_API_KEY tanımlıysa mesaj üretimi otomatik olarak Groq'a geçer.
+# Anahtar Render Environment Variable'dan okunur (kodda GÖRÜNMEZ).
+# ----------------------------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+def call_groq(prompt: str) -> str:
+    """Groq'un OpenAI-uyumlu API'sine istek atar, üretilen metni döner."""
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.8,
+        "max_tokens": 400,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        GROQ_URL,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return (body["choices"][0]["message"]["content"] or "").strip()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Groq {e.code}: {detail}")
+    except Exception as e:
+        raise RuntimeError(f"Groq bağlantı hatası: {e}")
 
 # Kabul edilen kategori seçenekleri (frontend'in gönderebileceği değerler)
 CLINIC_OPTIONS = [
@@ -252,10 +292,26 @@ Kurallar:
 
 @app.post("/generate-message")
 def generate_message(req: MessageRequest):
+    prompt = build_prompt(req)
+
+    # 1) Groq anahtarı tanımlıysa önce Groq'u kullan (ücretsiz, AQ. sorunu yok)
+    if GROQ_API_KEY:
+        try:
+            text = call_groq(prompt)
+            if not text:
+                raise HTTPException(status_code=502, detail="Groq boş cevap döndü.")
+            return {"message": text, "model": GROQ_MODEL, "provider": "groq"}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Groq hatası: {str(e)}")
+
+    # 2) Groq yoksa Gemini'ye düş
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="GEMINI_API_KEY tanımlı değil. Render Environment Variables'a ekleyin.",
+            detail="AI anahtarı tanımlı değil. Render'a GROQ_API_KEY (önerilen) "
+                   "veya GEMINI_API_KEY ekleyin.",
         )
     try:
         client = get_gemini_client()
@@ -265,13 +321,13 @@ def generate_message(req: MessageRequest):
         )
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=build_prompt(req),
+            contents=prompt,
             config=config,
         )
         text = (resp.text or "").strip()
         if not text:
             raise HTTPException(status_code=502, detail="Gemini boş cevap döndü.")
-        return {"message": text, "model": GEMINI_MODEL}
+        return {"message": text, "model": GEMINI_MODEL, "provider": "gemini"}
     except HTTPException:
         raise
     except Exception as e:
