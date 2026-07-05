@@ -79,6 +79,8 @@ def call_groq(prompt: str) -> str:
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "ClinicKeeper/1.0",
+            "Accept": "application/json",
         },
         method="POST",
     )
