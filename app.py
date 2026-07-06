@@ -1,7 +1,14 @@
 """
-ClinicKeeper API  —  CHLA No-Show Prediction
-FastAPI servisi. Modeli ve şemayı diskten yükler, insan-dostu girdileri
-modelin beklediği 26 sütuna çevirir, no-show olasılığı + risk seviyesi döner.
+ClinicKeeper API  —  No-Show Prediction (v2, sentetik model)
+FastAPI servisi. Klinik kurallara dayalı sentetik veriyle eğitilmiş modeli yükler,
+insan-dostu girdileri modelin beklediği sütunlara çevirir, no-show olasılığı +
+risk seviyesi döner. AI hatırlatma mesajı Groq (veya Gemini) ile üretilir.
+
+Klinik mantık:
+  - Geç iptal (24 saatten az kala) / hiç gelmeme -> ağır risk (no-show'a en yakın)
+  - Tek erken iptal (24+ saat kala)              -> nötr
+  - 2+ erken iptal                                -> düzensiz hasta, risk artar
+  - Sadakat (gelinen randevu)                     -> riski düşürür
 
 Render start command:  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
@@ -13,7 +20,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
 
 import urllib.request
 import urllib.error
@@ -28,20 +34,18 @@ except Exception:
 # ----------------------------------------------------------------------
 # 1) Model ve şemayı yükle
 # ----------------------------------------------------------------------
-MODEL_PATH = "chla_noshow_model.pkl"
-SCHEMA_PATH = "feature_schema.json"
+MODEL_PATH = "noshow_model_v2.pkl"
+SCHEMA_PATH = "feature_schema_v2.json"
 
 model = joblib.load(MODEL_PATH)
-with open(SCHEMA_PATH, "r") as f:
+with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
     SCHEMA = json.load(f)
 
-FEATURE_NAMES = SCHEMA["feature_names"]      # 26 sütun, DOĞRU sırada
-THRESHOLD = SCHEMA.get("threshold", 0.15)
+FEATURE_NAMES = SCHEMA["feature_names"]      # 16 sütun, DOĞRU sırada
+THRESHOLD = SCHEMA.get("threshold", 0.30)
 
 # ----------------------------------------------------------------------
 # Gemini ayarları — anahtar Render Environment Variable'dan okunur
-# (kodda GÖRÜNMEZ, GitHub'a gitmez)
-# google-genai SDK'sı hem AIza hem AQ. formatındaki anahtarları destekler.
 # ----------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -56,9 +60,8 @@ def get_gemini_client():
     return _gemini_client
 
 # ----------------------------------------------------------------------
-# Groq ayarları — Gemini alternatifi (ücretsiz, AQ. sorunu yok)
-# GROQ_API_KEY tanımlıysa mesaj üretimi otomatik olarak Groq'a geçer.
-# Anahtar Render Environment Variable'dan okunur (kodda GÖRÜNMEZ).
+# Groq ayarları — Gemini alternatifi (ücretsiz). GROQ_API_KEY tanımlıysa
+# mesaj üretimi otomatik Groq'a geçer. Anahtar Environment'tan okunur.
 # ----------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -94,106 +97,86 @@ def call_groq(prompt: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Groq bağlantı hatası: {e}")
 
-# Kabul edilen kategori seçenekleri (frontend'in gönderebileceği değerler)
-CLINIC_OPTIONS = [
-    "BAKERSFIELD CARE CLINIC",
-    "ENCINO CARE CENTER",
-    "SANTA MONICA CLINIC",
-    "SOUTH BAY CARE CENTER",
-    "VALENCIA CARE CENTER",
-    "OTHER",   # yukarıdakilerden biri değilse (tüm klinik sütunları 0 kalır)
-]
-RACE_OPTIONS = [
-    "Asian", "European", "MiddleEastern",
-    "NorthAmerican", "Other", "SouthAmerican",
-]
-ETHNICITY_OPTIONS = ["Non-Hispanic", "Others", "Hispanic"]  # Hispanic = baseline (her iki sütun 0)
-APPT_TYPE_OPTIONS = ["New", "Others", "Follow-up"]          # Follow-up = baseline (her iki sütun 0)
+# ----------------------------------------------------------------------
+# Kabul edilen kategori seçenekleri
+# Şube -> modeldeki one-hot sütun eşlemesi:
+#   Ataşehir = baseline (iki şube sütunu da 0)
+#   Bakırköy -> CLINIC_Bakırköy = 1
+#   Kadıköy  -> CLINIC_Kadıköy = 1
+# ----------------------------------------------------------------------
+CLINIC_OPTIONS = ["Kadıköy", "Ataşehir", "Bakırköy"]
+APPT_TYPE_OPTIONS = ["New", "Follow-up", "Others"]   # Follow-up = baseline
 
 # ----------------------------------------------------------------------
 # 2) İstek modeli (insan-dostu girdiler)
 # ----------------------------------------------------------------------
 class PredictRequest(BaseModel):
-    lead_time: int = Field(..., ge=0, description="Randevu ile kayıt arasındaki gün sayısı")
+    lead_time: int = Field(..., ge=0, description="Randevuya kalan gün")
     age: int = Field(..., ge=0, le=120)
     appt_num: int = Field(1, ge=1, description="Hastanın kaçıncı randevusu")
-    total_cancellations: int = Field(0, ge=0)
-    total_rescheduled: int = Field(0, ge=0)
-    total_success_appointments: int = Field(0, ge=0)
-    is_repeat: int = Field(0, ge=0, le=1, description="Tekrar eden hasta mı (0/1)")
+    total_gec_iptal: int = Field(0, ge=0, description="24 saatten az kala iptal (ağır)")
+    total_erken_iptal: int = Field(0, ge=0, description="24+ saat kala iptal (hafif)")
+    total_rescheduled: int = Field(0, ge=0, description="Erteleme sayısı")
+    total_success_appointments: int = Field(0, ge=0, description="Gelinen randevu")
+    is_repeat: int = Field(1, ge=0, le=1, description="Tekrar eden hasta mı (0/1)")
     day_of_week: int = Field(..., ge=0, le=6, description="0=Pazartesi ... 6=Pazar")
-    week_of_month: int = Field(..., ge=1, le=5)
+    week_of_month: int = Field(2, ge=1, le=5)
     month: int = Field(..., ge=1, le=12)
     hour_of_day: int = Field(..., ge=0, le=23)
     appt_type: str = Field("Follow-up", description=f"Seçenekler: {APPT_TYPE_OPTIONS}")
-    ethnicity: str = Field("Hispanic", description=f"Seçenekler: {ETHNICITY_OPTIONS}")
-    race: str = Field("Other", description=f"Seçenekler: {RACE_OPTIONS}")
-    clinic: str = Field("OTHER", description=f"Seçenekler: {CLINIC_OPTIONS}")
+    clinic: str = Field("Ataşehir", description=f"Seçenekler: {CLINIC_OPTIONS}")
 
 
 class MessageRequest(BaseModel):
     """AI hatırlatma mesajı üretmek için gereken bilgiler."""
-    patient_name: str = Field("Değerli hastamız", description="Hastanın adı (opsiyonel)")
+    patient_name: str = Field("Değerli hastamız")
     risk_band: str = Field(..., description="Düşük / Orta / Yüksek")
     noshow_percent: float = Field(..., description="No-show yüzdesi (0-100)")
-    clinic: str = Field("kliniğimiz", description="Klinik adı")
-    appt_type: str = Field("Follow-up", description="Randevu tipi")
-    lead_time: int = Field(0, description="Randevuya kaç gün var")
-    tone: str = Field("samimi", description="Mesaj tonu: samimi / resmi / kısa")
+    clinic: str = Field("kliniğimiz")
+    appt_type: str = Field("Follow-up")
+    lead_time: int = Field(0)
+    tone: str = Field("samimi", description="samimi / resmi / kısa")
 
 
 # ----------------------------------------------------------------------
-# 3) Girdiyi 26 sütuna çevir (one-hot), şema sırasına göre
+# 3) Girdiyi model sütunlarına çevir (one-hot), şema sırasına göre
 # ----------------------------------------------------------------------
 def build_feature_row(r: PredictRequest) -> pd.DataFrame:
-    # Tüm sütunları 0 ile başlat
     row = {name: 0 for name in FEATURE_NAMES}
 
     # Sayısal alanlar
     row["LEAD_TIME"] = r.lead_time
-    row["IS_REPEAT"] = r.is_repeat
-    row["APPT_NUM"] = r.appt_num
-    row["TOTAL_NUMBER_OF_CANCELLATIONS"] = r.total_cancellations
-    row["TOTAL_NUMBER_OF_RESCHEDULED"] = r.total_rescheduled
-    row["TOTAL_NUMBER_OF_SUCCESS_APPOINTMENT"] = r.total_success_appointments
-    row["DAY_OF_WEEK"] = r.day_of_week
-    row["WEEK_OF_MONTH"] = r.week_of_month
-    row["NUM_OF_MONTH"] = r.month
-    row["HOUR_OF_DAY"] = r.hour_of_day
     row["AGE"] = r.age
+    row["APPT_NUM"] = r.appt_num
+    row["TOTAL_GEC_IPTAL"] = r.total_gec_iptal
+    row["TOTAL_ERKEN_IPTAL"] = r.total_erken_iptal
+    row["TOTAL_RESCHEDULED"] = r.total_rescheduled
+    row["TOTAL_SUCCESS"] = r.total_success_appointments
+    row["IS_REPEAT"] = r.is_repeat
+    row["DAY_OF_WEEK"] = r.day_of_week
+    row["HOUR_OF_DAY"] = r.hour_of_day
+    row["NUM_OF_MONTH"] = r.month
+    row["WEEK_OF_MONTH"] = r.week_of_month
 
-    # Randevu tipi (Follow-up = baseline, iki sütun da 0 kalır)
+    # Randevu tipi (Follow-up = baseline)
     if r.appt_type == "New":
-        row["APPT_TYPE_STANDARDIZE_New"] = 1
+        row["APPT_TYPE_New"] = 1
     elif r.appt_type == "Others":
-        row["APPT_TYPE_STANDARDIZE_Others"] = 1
+        row["APPT_TYPE_Others"] = 1
 
-    # Etnik köken (Hispanic = baseline)
-    if r.ethnicity == "Non-Hispanic":
-        row["ETHNICITY_STANDARDIZE_Non-Hispanic"] = 1
-    elif r.ethnicity == "Others":
-        row["ETHNICITY_STANDARDIZE_Others"] = 1
+    # Şube (Ataşehir = baseline)
+    if r.clinic == "Bakırköy":
+        row["CLINIC_Bakırköy"] = 1
+    elif r.clinic == "Kadıköy":
+        row["CLINIC_Kadıköy"] = 1
 
-    # Irk (biri seçili olmalı; tanınmazsa 'Other')
-    race_col = f"RACE_STANDARDIZE_{r.race}"
-    if race_col in row:
-        row[race_col] = 1
-    else:
-        row["RACE_STANDARDIZE_Other"] = 1
-
-    # Klinik (OTHER = baseline, tüm klinik sütunları 0)
-    clinic_col = f"CLINIC_{r.clinic}"
-    if clinic_col in row:
-        row[clinic_col] = 1
-
-    # Şema sırasına göre tek satırlık DataFrame
-    return pd.DataFrame([[row[name] for name in FEATURE_NAMES]], columns=FEATURE_NAMES)
+    return pd.DataFrame([[row[name] for name in FEATURE_NAMES]], columns=FEATURE_NAMES).astype(float)
 
 
 def risk_band(prob: float) -> str:
     if prob >= 0.40:
         return "Yüksek"
-    elif prob >= THRESHOLD:
+    elif prob >= 0.20:
         return "Orta"
     return "Düşük"
 
@@ -201,12 +184,11 @@ def risk_band(prob: float) -> str:
 # ----------------------------------------------------------------------
 # 4) FastAPI uygulaması
 # ----------------------------------------------------------------------
-app = FastAPI(title="ClinicKeeper API", version="2.0-CHLA")
+app = FastAPI(title="ClinicKeeper API", version="3.0-synthetic")
 
-# GitHub Pages frontend'inin API'yi çağırabilmesi için CORS açık
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # istersen sadece kendi domain'ini yazabilirsin
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -216,7 +198,7 @@ app.add_middleware(
 def root():
     return {
         "service": "ClinicKeeper API",
-        "version": "2.0-CHLA",
+        "version": "3.0-synthetic",
         "model": SCHEMA.get("model_type"),
         "threshold": THRESHOLD,
         "n_features": len(FEATURE_NAMES),
@@ -231,14 +213,11 @@ def health():
 
 @app.get("/schema")
 def schema():
-    """Frontend'in hangi alanları göndermesi gerektiğini öğrenmesi için."""
     return {
         "features": FEATURE_NAMES,
         "threshold": THRESHOLD,
         "options": {
             "clinic": CLINIC_OPTIONS,
-            "race": RACE_OPTIONS,
-            "ethnicity": ETHNICITY_OPTIONS,
             "appt_type": APPT_TYPE_OPTIONS,
         },
     }
@@ -253,7 +232,7 @@ def predict(req: PredictRequest):
             "noshow_probability": round(prob, 4),
             "noshow_percent": round(prob * 100, 1),
             "risk_band": risk_band(prob),
-            "will_flag": prob >= THRESHOLD,   # bu hastaya hatırlatma gitmeli mi?
+            "will_flag": prob >= THRESHOLD,
             "threshold": THRESHOLD,
         }
     except Exception as e:
@@ -261,42 +240,36 @@ def predict(req: PredictRequest):
 
 
 # ----------------------------------------------------------------------
-# 5) AI hatırlatma mesajı — gerçek Gemini çağrısı
+# 5) AI hatırlatma mesajı
 # ----------------------------------------------------------------------
 def build_prompt(r: MessageRequest) -> str:
-    """Gemini'ye gönderilecek Türkçe talimatı hazırlar."""
-    ton_aciklama = {
-        "samimi": "sıcak, samimi ve nazik bir ton",
-        "resmi": "resmi ve profesyonel bir ton",
-        "kısa": "çok kısa ve öz, tek cümlelik bir ton",
-    }.get(r.tone, "sıcak ve nazik bir ton")
-
-    return f"""Sen bir sağlık kliniğinin hasta iletişim asistanısın.
-Aşağıdaki hastaya, yaklaşan randevusu için nazik bir hatırlatma mesajı yaz.
-
-Hasta bilgileri:
-- İsim: {r.patient_name}
-- Randevuya gelmeme (no-show) risk seviyesi: {r.risk_band} (%{r.noshow_percent})
-- Klinik: {r.clinic}
-- Randevu tipi: {r.appt_type}
-- Randevuya kalan gün: {r.lead_time}
-
-Kurallar:
-- Mesaj Türkçe olsun ve {ton_aciklama} kullansın.
-- Risk seviyesi 'Yüksek' ise, gelmenin önemini nazikçe vurgula ve onay/iptal için kolay bir çağrı ekle.
-- Risk 'Orta' ise dostça bir hatırlatma yeterli.
-- Risk 'Düşük' ise kısa ve olumlu bir hatırlatma yaz.
-- Hastayı suçlayan, baskılayan veya kaygı yaratan ifadeler KULLANMA.
-- Risk yüzdesini veya 'no-show' kelimesini mesajın içinde ASLA yazma (bunlar sadece senin bilgin).
-- Sadece mesajın kendisini döndür, başka açıklama ekleme.
-- Mesaj en fazla 4-5 cümle olsun."""
+    tone_map = {
+        "samimi": "sıcak, samimi ve nazik",
+        "resmi": "resmi, saygılı ve profesyonel",
+        "kısa": "çok kısa ve öz",
+    }
+    tone_desc = tone_map.get(r.tone, "sıcak ve nazik")
+    return (
+        f"Sen bir diş kliniğinin randevu hatırlatma asistanısın. "
+        f"Aşağıdaki hasta için {tone_desc} bir Türkçe hatırlatma mesajı yaz.\n\n"
+        f"Hasta adı: {r.patient_name}\n"
+        f"Klinik: {r.clinic}\n"
+        f"Randevu tipi: {r.appt_type}\n"
+        f"Randevuya kalan gün: {r.lead_time}\n"
+        f"No-show risk seviyesi: {r.risk_band} (%{r.noshow_percent})\n\n"
+        f"Kurallar:\n"
+        f"- Sadece mesaj metnini yaz, başka açıklama ekleme.\n"
+        f"- Hastayı suçlama, baskı kurma; nazikçe hatırlat ve gelmesini kolaylaştır.\n"
+        f"- Randevuyu onaylama veya değiştirme için kliniği aramaya davet et.\n"
+        f"- Mesaj 2-4 cümle olsun.\n"
+    )
 
 
 @app.post("/generate-message")
 def generate_message(req: MessageRequest):
     prompt = build_prompt(req)
 
-    # 1) Groq anahtarı tanımlıysa önce Groq'u kullan (ücretsiz, AQ. sorunu yok)
+    # 1) Groq anahtarı varsa önce Groq
     if GROQ_API_KEY:
         try:
             text = call_groq(prompt)
@@ -308,7 +281,7 @@ def generate_message(req: MessageRequest):
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Groq hatası: {str(e)}")
 
-    # 2) Groq yoksa Gemini'ye düş
+    # 2) Groq yoksa Gemini
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -317,14 +290,9 @@ def generate_message(req: MessageRequest):
         )
     try:
         client = get_gemini_client()
-        config = genai_types.GenerateContentConfig(
-            temperature=0.8,
-            max_output_tokens=400,
-        )
+        config = genai_types.GenerateContentConfig(temperature=0.8, max_output_tokens=400)
         resp = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=config,
+            model=GEMINI_MODEL, contents=prompt, config=config,
         )
         text = (resp.text or "").strip()
         if not text:

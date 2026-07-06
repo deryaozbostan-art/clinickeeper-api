@@ -1,0 +1,32 @@
+{
+  "model_type": "GradientBoostingClassifier",
+  "threshold": 0.3,
+  "target": "IS_NOSHOW",
+  "n_features": 16,
+  "feature_names": [
+    "LEAD_TIME",
+    "AGE",
+    "APPT_NUM",
+    "TOTAL_GEC_IPTAL",
+    "TOTAL_ERKEN_IPTAL",
+    "TOTAL_RESCHEDULED",
+    "TOTAL_SUCCESS",
+    "IS_REPEAT",
+    "DAY_OF_WEEK",
+    "HOUR_OF_DAY",
+    "NUM_OF_MONTH",
+    "WEEK_OF_MONTH",
+    "APPT_TYPE_New",
+    "APPT_TYPE_Others",
+    "CLINIC_Bakırköy",
+    "CLINIC_Kadıköy"
+  ],
+  "noshow_base_rate": 0.2031,
+  "test_metrics": {
+    "roc_auc": 0.7941,
+    "pr_auc": 0.5236,
+    "precision": 0.4901,
+    "recall": 0.5342,
+    "f1": 0.5112
+  }
+}
