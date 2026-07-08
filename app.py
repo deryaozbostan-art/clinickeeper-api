@@ -136,15 +136,6 @@ class MessageRequest(BaseModel):
     appt_type: str = Field("Follow-up")
     lead_time: int = Field(0)
     tone: str = Field("samimi", description="samimi / resmi / kısa")
-  class MessageRequest(BaseModel):
-    """AI hatırlatma mesajı üretmek için gereken bilgiler."""
-    patient_name: str = Field("Değerli hastamız")
-    risk_band: str = Field(..., description="Düşük / Orta / Yüksek")
-    noshow_percent: float = Field(..., description="No-show yüzdesi (0-100)")
-    clinic: str = Field("kliniğimiz")
-    appt_type: str = Field("Follow-up")
-    lead_time: int = Field(0)
-    tone: str = Field("samimi", description="samimi / resmi / kısa")
 
 
 class EmotionRequest(BaseModel):
@@ -316,7 +307,9 @@ def generate_message(req: MessageRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini hatası: {str(e)}")
-      # ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
 # 6) Görüşme duygu analizi (opsiyonel karar-destek katmanı)
 # ----------------------------------------------------------------------
 def build_emotion_prompt(text: str) -> str:
