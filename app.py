@@ -260,12 +260,13 @@ def build_prompt(r: MessageRequest) -> str:
         f"Hasta adı: {r.patient_name}\n"
         f"Klinik: {r.clinic}\n"
         f"Randevu tipi: {r.appt_type}\n"
-        f"Randevuya kalan gün: {r.lead_time}\n"
         f"No-show risk seviyesi: {r.risk_band} (%{r.noshow_percent})\n\n"
         f"Kurallar:\n"
         f"- Sadece mesaj metnini yaz, başka açıklama ekleme.\n"
+        f"- Yaklaşan randevuyu hatırlat; 'randevunuz yaklaşıyor' veya 'randevunuza az bir zaman kaldı' gibi ifadeler kullanabilirsin.\n"
+        f"- Ama KESİN gün sayısı ya da tarih YAZMA (ör. '30 gün sonra', '5 Haziran' gibi ifadeler kullanma); randevunun tam zamanını bilmiyorsun.\n"
         f"- Hastayı suçlama, baskı kurma; nazikçe hatırlat ve gelmesini kolaylaştır.\n"
-        f"- Randevuyu onaylama veya değiştirme için kliniği aramaya davet et.\n"
+        f"- Randevuyu onaylamak veya değiştirmek için kliniği aramaya davet et.\n"
         f"- Mesaj 2-4 cümle olsun.\n"
     )
 
