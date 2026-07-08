@@ -136,6 +136,20 @@ class MessageRequest(BaseModel):
     appt_type: str = Field("Follow-up")
     lead_time: int = Field(0)
     tone: str = Field("samimi", description="samimi / resmi / kısa")
+  class MessageRequest(BaseModel):
+    """AI hatırlatma mesajı üretmek için gereken bilgiler."""
+    patient_name: str = Field("Değerli hastamız")
+    risk_band: str = Field(..., description="Düşük / Orta / Yüksek")
+    noshow_percent: float = Field(..., description="No-show yüzdesi (0-100)")
+    clinic: str = Field("kliniğimiz")
+    appt_type: str = Field("Follow-up")
+    lead_time: int = Field(0)
+    tone: str = Field("samimi", description="samimi / resmi / kısa")
+
+
+class EmotionRequest(BaseModel):
+    """Görüşme metninden duygu/tereddüt analizi için."""
+    text: str = Field(..., description="Hasta görüşme notu veya yazılı cevabı")
 
 
 # ----------------------------------------------------------------------
@@ -302,3 +316,54 @@ def generate_message(req: MessageRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini hatası: {str(e)}")
+      # ----------------------------------------------------------------------
+# 6) Görüşme duygu analizi (opsiyonel karar-destek katmanı)
+# ----------------------------------------------------------------------
+def build_emotion_prompt(text: str) -> str:
+    return (
+        f"Sen bir diş kliniği için çalışan bir iletişim analiz asistanısın. "
+        f"Aşağıda bir hastanın randevu görüşmesindeki sözleri veya yazılı cevabı var. "
+        f"Bu metnin duygu tonunu analiz et ve hastanın randevuya gelme konusundaki "
+        f"tereddüt/isteklilik durumunu değerlendir.\n\n"
+        f"Hasta metni:\n\"{text}\"\n\n"
+        f"Sadece şu JSON formatında cevap ver, başka hiçbir şey yazma:\n"
+        f"{{\n"
+        f'  "ton": "Kararsız / İstekli / İsteksiz / Nötr / Kaygılı gibi tek kelime",\n'
+        f'  "tereddut_yuzde": 0-100 arası bir sayı (yüksek = gelmeme eğilimi yüksek),\n'
+        f'  "yorum": "Tek cümlelik kısa Türkçe açıklama"\n'
+        f"}}\n"
+    )
+
+
+@app.post("/analyze-emotion")
+def analyze_emotion(req: EmotionRequest):
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Metin boş olamaz.")
+
+    prompt = build_emotion_prompt(req.text.strip())
+
+    if not GROQ_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GROQ_API_KEY tanımlı değil.",
+        )
+
+    try:
+        raw = call_groq(prompt)
+        cleaned = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(cleaned)
+        return {
+            "ton": result.get("ton", "Nötr"),
+            "tereddut_yuzde": result.get("tereddut_yuzde", 50),
+            "yorum": result.get("yorum", ""),
+            "provider": "groq",
+        }
+    except json.JSONDecodeError:
+        return {
+            "ton": "Belirsiz",
+            "tereddut_yuzde": 50,
+            "yorum": raw[:200] if raw else "Analiz edilemedi.",
+            "provider": "groq",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Analiz hatası: {str(e)}")
