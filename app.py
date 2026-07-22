@@ -405,3 +405,50 @@ def randevu_ekle(req: RandevuTalebi):
         return {"ok": True, "kayit": result.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Randevu kaydedilemedi: {str(e)}")
+      # ----------------------------------------------------------------------
+# 8) Vapi tool endpoint — AI randevu bilgisini buraya yollar
+# ----------------------------------------------------------------------
+from fastapi import Request
+
+VAPI_DEFAULT_USER_ID = os.environ.get("VAPI_DEFAULT_USER_ID", "")
+
+
+@app.post("/vapi-randevu")
+async def vapi_randevu(request: Request):
+    """Vapi tool call'unu karşılar, randevu talebini Supabase'e yazar."""
+    try:
+        body = await request.json()
+        tool_calls = (
+            body.get("message", {}).get("toolCalls")
+            or body.get("message", {}).get("toolCallList")
+            or []
+        )
+        if not tool_calls:
+            return {"results": [{"toolCallId": "unknown", "result": "Veri alınamadı."}]}
+
+        results = []
+        for tc in tool_calls:
+            tc_id = tc.get("id", "unknown")
+            args = tc.get("function", {}).get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args)
+
+            sb = get_supabase()
+            data = {
+                "user_id": VAPI_DEFAULT_USER_ID,
+                "hasta_adi": args.get("hasta_adi", "Bilinmiyor"),
+                "telefon": args.get("telefon") or None,
+                "istenen_tarih": args.get("istenen_tarih") or None,
+                "istenen_saat": args.get("istenen_saat") or None,
+                "durum": "yeni",
+                "kaynak": "AI-telefon",
+            }
+            sb.table("randevu_talepleri").insert(data).execute()
+            results.append({
+                "toolCallId": tc_id,
+                "result": "Randevu talebi kaydedildi."
+            })
+
+        return {"results": results}
+    except Exception as e:
+        return {"results": [{"toolCallId": "unknown", "result": f"Hata: {str(e)}"}]}
