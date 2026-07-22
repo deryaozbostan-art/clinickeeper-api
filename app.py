@@ -361,3 +361,47 @@ def analyze_emotion(req: EmotionRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Analiz hatası: {str(e)}")
+      # ----------------------------------------------------------------------
+# 7) Randevu talepleri (AI ile alınan randevular)
+# ----------------------------------------------------------------------
+from supabase import create_client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+_sb_client = None
+def get_supabase():
+    global _sb_client
+    if _sb_client is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("Supabase ayarları eksik.")
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return _sb_client
+
+
+class RandevuTalebi(BaseModel):
+    user_id: str = Field(..., description="Klinik kullanıcı ID")
+    hasta_adi: str = Field(...)
+    telefon: str = Field("")
+    istenen_tarih: str = Field("")
+    istenen_saat: str = Field("")
+    kaynak: str = Field("AI")
+
+
+@app.post("/randevu-ekle")
+def randevu_ekle(req: RandevuTalebi):
+    try:
+        sb = get_supabase()
+        data = {
+            "user_id": req.user_id,
+            "hasta_adi": req.hasta_adi,
+            "telefon": req.telefon or None,
+            "istenen_tarih": req.istenen_tarih or None,
+            "istenen_saat": req.istenen_saat or None,
+            "durum": "yeni",
+            "kaynak": req.kaynak,
+        }
+        result = sb.table("randevu_talepleri").insert(data).execute()
+        return {"ok": True, "kayit": result.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Randevu kaydedilemedi: {str(e)}")
